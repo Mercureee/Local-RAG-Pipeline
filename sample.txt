@@ -1,0 +1,82 @@
+HELIODON DISTRIBUTED CACHE — TECHNICAL OVERVIEW
+
+1. Introduction
+
+Heliodon is a distributed in-memory cache designed for read-heavy workloads at
+medium scale. It was first released internally in 2021 under the codename
+"Sunstone" and reached general availability as version 1.0 in March 2022.
+Heliodon is written in Rust and exposes a binary wire protocol on TCP port
+7311 by default. The project is maintained by the fictional Aperture Data
+Systems team and is not affiliated with any real product.
+
+2. Core Concepts
+
+A Heliodon deployment is organized into "rings." A ring is a logical group of
+between 3 and 64 nodes that share responsibility for a keyspace. Each key is
+mapped to a node using rendezvous hashing (also called highest-random-weight
+hashing), which Heliodon chose over consistent hashing to reduce key
+reshuffling when nodes are added or removed. When a node joins a ring, on
+average only 1/N of the keys move, where N is the new node count.
+
+Every value stored in Heliodon carries a "vitality score," an internal metric
+between 0 and 100 that estimates how likely the value is to be read again soon.
+The vitality score starts at 50 for a new entry and increases by 5 on every
+cache hit, capped at 100. When memory pressure forces an eviction, Heliodon
+removes the entries with the lowest vitality score first. This policy is called
+Vitality-Weighted Eviction, and it is the default eviction strategy.
+
+3. Consistency Model
+
+Heliodon offers tunable consistency per request. The three levels are ONE,
+QUORUM, and ALL. Under ONE, a write is acknowledged as soon as a single replica
+confirms it. Under QUORUM, a majority of replicas must confirm. Under ALL, every
+replica in the replication set must confirm before the write returns. The
+default replication factor is 3, which means a QUORUM write waits for 2
+acknowledgements. Read repair runs asynchronously and reconciles divergent
+replicas within a target window of 200 milliseconds.
+
+4. Time-To-Live and Expiration
+
+Each entry may be assigned a time-to-live (TTL) in seconds. If no TTL is set,
+the entry defaults to a TTL of 3600 seconds (one hour). Heliodon does not use a
+background sweeper thread to expire keys eagerly. Instead, it uses lazy
+expiration: an expired key is only removed when a client next attempts to read
+it. To prevent expired-but-unread keys from consuming memory indefinitely, a
+sampling task inspects 20 random keys every 10 seconds and purges any that have
+expired. This design was chosen to keep tail latency predictable.
+
+5. Persistence
+
+Although Heliodon is primarily an in-memory system, it supports optional
+durability through an append-only log called the Ember Log. When durability is
+enabled, every write is appended to the Ember Log before being acknowledged to
+the client. The Ember Log is compacted automatically once it exceeds 512
+megabytes. On restart, a node replays its Ember Log to reconstruct state.
+Compaction never blocks writes; it runs on a dedicated background thread.
+
+6. Observability
+
+Heliodon exposes metrics in a plaintext format on HTTP port 7312. The single
+most important metric to monitor is "ring_saturation," a value between 0.0 and
+1.0 representing how close a ring is to its memory ceiling. Aperture Data
+Systems recommends adding nodes to a ring once ring_saturation exceeds 0.75 for
+a sustained period of five minutes. A ring_saturation of 1.0 triggers aggressive
+Vitality-Weighted Eviction and may increase read latency.
+
+7. Client Configuration
+
+The official client library is named "sunbeam." By default, sunbeam opens a
+connection pool of 8 sockets per node and retries failed requests up to 3 times
+with exponential backoff starting at 25 milliseconds. Sunbeam clients discover
+ring topology automatically by querying any single node on startup; this process
+is called "ring gossip bootstrap." A client never needs the full node list in
+its configuration — one seed address is sufficient.
+
+8. Known Limitations
+
+Heliodon does not support cross-ring transactions. A single write may only touch
+keys that belong to one ring. Range queries are not supported, because
+rendezvous hashing distributes adjacent keys across unrelated nodes. Values
+larger than 4 megabytes are rejected outright with error code E_TOO_LARGE.
+Finally, Heliodon has no built-in authentication in version 1.0; operators are
+expected to run it inside a trusted network boundary.
